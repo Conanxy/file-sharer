@@ -85,6 +85,23 @@ Android arm64 APK:
 npm run tauri -- android build --target aarch64 --apk --split-per-abi --ci
 ```
 
+Android release signing uses GitHub Actions secrets:
+
+- `ANDROID_KEYSTORE_BASE64`
+- `ANDROID_KEYSTORE_PASSWORD`
+- `ANDROID_KEY_ALIAS`
+- `ANDROID_KEY_PASSWORD`
+
+Create `ANDROID_KEYSTORE_BASE64` from the local `.jks` file:
+
+```bash
+base64 -i /path/to/file-sharer-release.jks
+```
+
+Never commit `.jks`, `.keystore`, or `.p12` files to the repository.
+
+中文：Android 发布包通过 GitHub Secrets 注入签名信息；不要把 `.jks`、`.keystore` 或 `.p12` 文件提交到仓库。
+
 macOS universal package:
 
 ```bash

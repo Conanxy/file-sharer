@@ -8,6 +8,9 @@ src-tauri/gen/android/.idea
 src-tauri/gen/android/**/build
 src-tauri/gen/android/**/.kotlin
 src-tauri/gen/android/local.properties
+*.jks
+*.keystore
+*.p12
 *.log
 .DS_Store
 .playwright-mcp

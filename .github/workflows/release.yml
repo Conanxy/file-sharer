@@ -104,13 +104,42 @@ jobs:
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.1.12297006
 
+      - name: Sign Android APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEY_PASSWORD" ]; then
+            echo "Missing Android signing secrets"
+            exit 1
+          fi
+          mkdir -p signing
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > signing/release.jks
+          unsigned_apk="$(find src-tauri/gen/android/app/build/outputs/apk -name '*arm64*unsigned*.apk' -type f | head -n 1)"
+          if [ -z "$unsigned_apk" ]; then
+            echo "Unsigned Android arm64 APK not found"
+            find src-tauri/gen/android/app/build/outputs/apk -type f | sort
+            exit 1
+          fi
+          signed_apk="src-tauri/gen/android/app/build/outputs/apk/File-Sharer-${{ github.ref_name }}-android-arm64-signed.apk"
+          apksigner sign \
+            --ks signing/release.jks \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+            --key-pass "pass:$ANDROID_KEY_PASSWORD" \
+            --out "$signed_apk" \
+            "$unsigned_apk"
+          apksigner verify --verbose --print-certs "$signed_apk"
+
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4
         with:
           name: file-sharer-android-arm64
           if-no-files-found: error
           path: |
-            src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            src-tauri/gen/android/app/build/outputs/apk/*signed.apk
 
   publish-release:
     name: Publish GitHub release
