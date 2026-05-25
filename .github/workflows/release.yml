@@ -134,8 +134,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          mapfile -t assets < <(find release-assets -type f | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found"
+            exit 1
+          fi
+          printf '%s\n' "${assets[@]}"
           gh release delete "${{ github.ref_name }}" --yes || true
-          gh release create "${{ github.ref_name }}" release-assets/* \
+          gh release create "${{ github.ref_name }}" "${assets[@]}" \
             --title "File Sharer ${{ github.ref_name }}" \
             --notes "File Sharer ${{ github.ref_name }}
 
