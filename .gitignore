@@ -1,0 +1,15 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/target-desktop
+target
+src-tauri/gen/android/.gradle
+src-tauri/gen/android/.idea
+src-tauri/gen/android/**/build
+src-tauri/gen/android/**/.kotlin
+src-tauri/gen/android/local.properties
+*.log
+.DS_Store
+.playwright-mcp
+.deepseek
+.serena

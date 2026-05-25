@@ -1,0 +1,33 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default app capability",
+  "windows": [
+    "main",
+    "overlay"
+  ],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        {
+          "path": "$DOWNLOAD/File Sharer/**"
+        },
+        {
+          "path": "$APPDATA/File Sharer/**"
+        },
+        {
+          "path": "$APPLOCALDATA/File Sharer/**"
+        },
+        {
+          "path": "/storage/emulated/0/Android/data/dev.fang.file_sharer/**"
+        },
+        {
+          "path": "/storage/emulated/0/Download/File Sharer/**"
+        }
+      ]
+    }
+  ]
+}

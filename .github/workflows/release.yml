@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    name: Build desktop (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: windows-x64
+            runner: windows-latest
+            args: ""
+          - name: macos-universal
+            runner: macos-latest
+            args: "--target universal-apple-darwin"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        if: matrix.platform.name != 'macos-universal'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust for macOS universal
+        if: matrix.platform.name == 'macos-universal'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build desktop bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: File Sharer ${{ github.ref_name }}
+          releaseBody: |
+            File Sharer ${{ github.ref_name }}
+
+            Tested manually only on Android arm64 and macOS Apple Silicon M4.
+            Windows, macOS Intel, and other environments are automatically built but not manually tested.
+          releaseDraft: true
+          prerelease: true
+          args: ${{ matrix.platform.args }}
+
+  android:
+    name: Build Android arm64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.1.12297006"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Android APK
+        run: npm run tauri -- android build --target aarch64 --apk --split-per-abi --ci
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.1.12297006
+
+      - name: Upload Android APK to release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: true
+          files: |
+            src-tauri/gen/android/app/build/outputs/apk/**/*.apk
