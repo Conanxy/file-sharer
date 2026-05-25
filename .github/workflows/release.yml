@@ -130,17 +130,15 @@ jobs:
         run: find release-assets -type f -maxdepth 6 | sort
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: File Sharer ${{ github.ref_name }}
-          body: |
-            File Sharer ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "${{ github.ref_name }}" --yes --cleanup-tag=false || true
+          gh release create "${{ github.ref_name }}" release-assets/* \
+            --title "File Sharer ${{ github.ref_name }}" \
+            --notes "File Sharer ${{ github.ref_name }}
 
-            Tested manually only on Android arm64 and macOS Apple Silicon M4.
-            Windows, macOS Intel, and other environments are automatically built but not manually tested.
-          draft: false
-          prerelease: true
-          make_latest: true
-          fail_on_unmatched_files: true
-          files: release-assets/**
+          Tested manually only on Android arm64 and macOS Apple Silicon M4.
+          Windows, macOS Intel, and other environments are automatically built but not manually tested." \
+            --prerelease \
+            --latest
