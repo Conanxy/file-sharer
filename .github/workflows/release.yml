@@ -145,7 +145,6 @@ jobs:
             --title "File Sharer ${{ github.ref_name }}" \
             --notes "File Sharer ${{ github.ref_name }}
 
-          Tested manually only on Android arm64 and macOS Apple Silicon M4.
-          Windows, macOS Intel, and other environments are automatically built but not manually tested." \
-            --prerelease \
-            --latest
+            Tested manually only on Android arm64 and macOS Apple Silicon M4.
+            Windows, macOS Intel, and other environments are automatically built but not manually tested." \
+            --prerelease
