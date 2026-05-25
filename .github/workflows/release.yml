@@ -91,6 +91,9 @@ jobs:
       - name: Install Android NDK
         run: sdkmanager "ndk;27.1.12297006"
 
+      - name: Install Android build tools
+        run: sdkmanager "build-tools;36.0.0"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -124,14 +127,20 @@ jobs:
             exit 1
           fi
           signed_apk="src-tauri/gen/android/app/build/outputs/apk/File-Sharer-${{ github.ref_name }}-android-arm64-signed.apk"
-          apksigner sign \
+          apksigner_path="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
+          if [ -z "$apksigner_path" ]; then
+            echo "apksigner not found"
+            find "$ANDROID_HOME/build-tools" -maxdepth 2 -type f | sort
+            exit 1
+          fi
+          "$apksigner_path" sign \
             --ks signing/release.jks \
             --ks-key-alias "$ANDROID_KEY_ALIAS" \
             --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
             --key-pass "pass:$ANDROID_KEY_PASSWORD" \
             --out "$signed_apk" \
             "$unsigned_apk"
-          apksigner verify --verbose --print-certs "$signed_apk"
+          "$apksigner_path" verify --verbose --print-certs "$signed_apk"
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4
