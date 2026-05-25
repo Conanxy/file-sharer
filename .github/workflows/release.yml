@@ -47,20 +47,23 @@ jobs:
         run: npm ci
 
       - name: Build desktop bundle
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: File Sharer ${{ github.ref_name }}
-          releaseBody: |
-            File Sharer ${{ github.ref_name }}
+        run: npm run tauri -- build ${{ matrix.platform.args }}
 
-            Tested manually only on Android arm64 and macOS Apple Silicon M4.
-            Windows, macOS Intel, and other environments are automatically built but not manually tested.
-          releaseDraft: true
-          prerelease: true
-          args: ${{ matrix.platform.args }}
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: file-sharer-${{ matrix.platform.name }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/**/bundle/**/*.dmg
+            src-tauri/target/**/bundle/**/*.exe
+            src-tauri/target/**/bundle/**/*.msi
+            src-tauri/target/**/bundle/**/*.app.tar.gz
+            src-tauri/target/**/bundle/**/*.app.tar.gz.sig
+            src-tauri/target/**/bundle/**/*.nsis.zip
+            src-tauri/target/**/bundle/**/*.nsis.zip.sig
+            src-tauri/target/**/bundle/**/*.msi.zip
+            src-tauri/target/**/bundle/**/*.msi.zip.sig
 
   android:
     name: Build Android arm64
@@ -101,10 +104,43 @@ jobs:
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.1.12297006
 
-      - name: Upload Android APK to release
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: file-sharer-android-arm64
+          if-no-files-found: error
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+
+  publish-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - desktop
+      - android
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: find release-assets -type f -maxdepth 6 | sort
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          tag_name: ${{ github.ref_name }}
+          name: File Sharer ${{ github.ref_name }}
+          body: |
+            File Sharer ${{ github.ref_name }}
+
+            Tested manually only on Android arm64 and macOS Apple Silicon M4.
+            Windows, macOS Intel, and other environments are automatically built but not manually tested.
+          draft: false
           prerelease: true
-          files: |
-            src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: release-assets/**
