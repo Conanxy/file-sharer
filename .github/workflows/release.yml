@@ -132,8 +132,9 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release delete "${{ github.ref_name }}" --yes --cleanup-tag=false || true
+          gh release delete "${{ github.ref_name }}" --yes || true
           gh release create "${{ github.ref_name }}" release-assets/* \
             --title "File Sharer ${{ github.ref_name }}" \
             --notes "File Sharer ${{ github.ref_name }}
