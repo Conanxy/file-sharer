@@ -957,16 +957,18 @@ dependencies = [
 
 [[package]]
 name = "file-sharer"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "core-foundation",
  "core-graphics",
+ "libc",
  "objc2-app-kit",
  "objc2-foundation",
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

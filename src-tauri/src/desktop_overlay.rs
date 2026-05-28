@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
@@ -11,12 +11,14 @@ use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Runtime, Size};
 
 pub struct OverlayState {
     busy: AtomicBool,
+    mode: Mutex<String>,
 }
 
 impl OverlayState {
     pub fn new() -> Self {
         Self {
             busy: AtomicBool::new(false),
+            mode: Mutex::new("normal".to_string()),
         }
     }
 
@@ -26,6 +28,15 @@ impl OverlayState {
 
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    pub fn set_mode(&self, mode: &str) {
+        let mut current_mode = self.mode.lock().expect("overlay mode poisoned");
+        *current_mode = mode.to_string();
+    }
+
+    pub fn mode(&self) -> String {
+        self.mode.lock().expect("overlay mode poisoned").clone()
     }
 }
 
@@ -47,7 +58,6 @@ pub fn hide_overlay_window(app: &AppHandle) {
 
     let _ = window.set_focusable(false);
     let _ = window.hide();
-    let _ = window.set_focusable(true);
 }
 
 pub fn position_overlay_window<R: Runtime>(window: &tauri::WebviewWindow<R>) {
@@ -71,8 +81,9 @@ pub fn position_overlay_window<R: Runtime>(window: &tauri::WebviewWindow<R>) {
 
 pub fn resize_overlay_for_mode<R: Runtime>(window: &tauri::WebviewWindow<R>, mode: &str) {
     let (width, height) = match mode {
-        "drag" => (456.0, 116.0),
+        "drag" => (560.0, 300.0),
         "transfer" => (456.0, 128.0),
+        "confirm" => (560.0, 300.0),
         _ => (456.0, 116.0),
     };
     let _ = window.set_size(Size::Logical(LogicalSize::new(width, height)));
@@ -80,7 +91,7 @@ pub fn resize_overlay_for_mode<R: Runtime>(window: &tauri::WebviewWindow<R>, mod
 }
 
 #[cfg(target_os = "macos")]
-pub fn start_drag_monitor(app: AppHandle, _state: Arc<OverlayState>) {
+pub fn start_drag_monitor(app: AppHandle, state: Arc<OverlayState>) {
     std::thread::spawn(move || {
         let mut visible = false;
         let mut last_seen = Instant::now();
@@ -103,11 +114,13 @@ pub fn start_drag_monitor(app: AppHandle, _state: Arc<OverlayState>) {
                 active_change_count = Some(drag_state.change_count);
                 last_seen = Instant::now();
                 let _ = app.emit_to("overlay", "desktop-file-drag", true);
-                show_overlay_window(&app);
+                if !state.is_busy() {
+                    show_overlay_window(&app);
+                }
                 visible = true;
             } else if continuing_file_drag {
                 last_seen = Instant::now();
-            } else if visible && last_seen.elapsed() > Duration::from_millis(700) {
+            } else if visible && last_seen.elapsed() > Duration::from_millis(700) && !state.is_busy() {
                 let _ = app.emit_to("overlay", "desktop-file-drag", false);
                 hide_overlay_window(&app);
                 visible = false;

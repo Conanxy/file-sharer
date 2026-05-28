@@ -50,11 +50,7 @@ class NativeOpenerPlugin(private val activity: Activity) : Plugin(activity) {
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
       }
 
-      val chooser = Intent.createChooser(intent, "打开文件").apply {
-        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-      }
-      activity.startActivity(chooser)
+      activity.startActivity(intent)
       invoke.resolve()
     } catch (ex: Exception) {
       invoke.reject(ex.message ?: "打开失败")
@@ -152,11 +148,7 @@ class NativeOpenerPlugin(private val activity: Activity) : Plugin(activity) {
       addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
 
-    val chooser = Intent.createChooser(intent, "打开文件").apply {
-      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    }
-    activity.startActivity(chooser)
+    activity.startActivity(intent)
   }
 
   private fun mimeType(file: File, uri: Uri): String {

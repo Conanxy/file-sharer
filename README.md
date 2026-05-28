@@ -6,14 +6,14 @@ File Sharer is a LAN-only file transfer tool built with Tauri 2, TypeScript, and
 
 ## Status
 
-This project is early-stage software. Version `0.0.1` has only been tested on:
+This project is early-stage software. Version `0.0.2` has only been tested on:
 
 - Android arm64
 - macOS on Apple Silicon M4
 
 Windows, macOS Intel, other Android ABIs, and other environments have not been tested yet.
 
-中文：当前版本仍处于早期阶段。`0.0.1` 只在 Android arm64 和 Apple Silicon M4 的 macOS 上测试过；Windows、Intel Mac、其他 Android 架构和其他环境尚未测试。
+中文：当前版本仍处于早期阶段。`0.0.2` 只在 Android arm64 和 Apple Silicon M4 的 macOS 上测试过；Windows、Intel Mac、其他 Android 架构和其他环境尚未测试。
 
 ## Features
 
@@ -113,14 +113,14 @@ npm run tauri -- build --target universal-apple-darwin
 
 ## Release
 
-GitHub Actions builds release artifacts when a tag like `v0.0.1` is pushed.
+GitHub Actions builds release artifacts when a tag like `v0.0.2` is pushed.
 
 ```bash
-git tag v0.0.1
+git tag v0.0.2
 git push origin main --tags
 ```
 
-中文：推送 `v0.0.1` 这类 tag 后，GitHub Actions 会自动构建并发布安装包。
+中文：推送 `v0.0.2` 这类 tag 后，GitHub Actions 会自动构建并发布安装包。
 
 ## Security Scope
 

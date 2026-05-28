@@ -28,6 +28,7 @@ pub struct PublishedFile {
 #[derive(Default, Deserialize, Serialize)]
 struct AppSettings {
     device_name: Option<String>,
+    drag_send_immediately: Option<bool>,
 }
 
 #[tauri::command]
@@ -45,6 +46,7 @@ fn set_device_name(name: String, state: State<'_, AppState>) -> Result<Identity,
     let identity = state.network.set_device_name(name)?;
     let settings = AppSettings {
         device_name: Some(identity.name.clone()),
+        drag_send_immediately: None,
     };
     let settings_path = state
         .settings_path
@@ -75,6 +77,33 @@ fn transfer_history(state: State<'_, AppState>) -> Vec<TransferEvent> {
 #[tauri::command]
 fn clear_transfer_history(state: State<'_, AppState>) {
     state.network.clear_transfer_history();
+}
+
+#[tauri::command]
+fn get_drag_send_immediately(state: State<'_, AppState>) -> Result<bool, String> {
+    let settings_path = state
+        .settings_path
+        .lock()
+        .map_err(|_| "设置路径状态异常".to_string())?
+        .clone();
+    let settings = read_settings(&settings_path)?;
+    Ok(settings.drag_send_immediately.unwrap_or(true))
+}
+
+#[tauri::command]
+fn set_drag_send_immediately(
+    value: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let settings_path = state
+        .settings_path
+        .lock()
+        .map_err(|_| "设置路径状态异常".to_string())?
+        .clone();
+    let mut settings = read_settings(&settings_path).unwrap_or_default();
+    settings.drag_send_immediately = Some(value);
+    write_settings(&settings_path, &settings)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -125,6 +154,24 @@ fn record_sent_transfer(
 }
 
 #[tauri::command]
+fn set_discovery_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) {
+    state.network.set_discovery_enabled(enabled);
+}
+
+#[tauri::command]
+fn is_discovery_enabled(state: State<'_, AppState>) -> bool {
+    state.network.is_discovery_enabled()
+}
+
+#[tauri::command]
+fn probe_discovery(state: State<'_, AppState>) {
+    state.network.probe_discovery();
+}
+
+#[tauri::command]
 fn cancel_transfer(transfer_id: String, state: State<'_, AppState>) {
     state.network.cancel_transfer(transfer_id);
 }
@@ -161,8 +208,10 @@ fn set_overlay_busy(busy: bool, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-fn show_overlay(app: tauri::AppHandle) {
-    desktop_overlay::show_overlay_window(&app);
+fn show_overlay(app: tauri::AppHandle, state: State<'_, AppState>) {
+    if !state.overlay.is_busy() && state.overlay.mode() != "confirm" {
+        desktop_overlay::show_overlay_window(&app);
+    }
 }
 
 #[tauri::command]
@@ -174,8 +223,23 @@ fn hide_overlay(app: tauri::AppHandle, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-fn set_overlay_mode(mode: String, app: tauri::AppHandle) {
+fn set_overlay_mode(mode: String, app: tauri::AppHandle, state: State<'_, AppState>) {
+    let current_mode = state.overlay.mode();
+    if (state.overlay.is_busy() || current_mode == "confirm")
+        && matches!(mode.as_str(), "normal" | "drag")
+    {
+        return;
+    }
+    state.overlay.set_mode(&mode);
     resize_overlay_window(&app, &mode);
+}
+
+#[tauri::command]
+fn position_overlay(app: tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("overlay") else {
+        return;
+    };
+    desktop_overlay::position_overlay_window(&window);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -249,7 +313,13 @@ pub fn run() {
             set_overlay_busy,
             show_overlay,
             hide_overlay,
-            set_overlay_mode
+            set_overlay_mode,
+            position_overlay,
+            get_drag_send_immediately,
+            set_drag_send_immediately,
+            set_discovery_enabled,
+            is_discovery_enabled,
+            probe_discovery
         ])
         .run(tauri::generate_context!())
         .expect("error while running File Sharer");

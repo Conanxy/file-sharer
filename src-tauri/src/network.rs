@@ -12,7 +12,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
+use socket2::{Domain, Protocol, Socket, Type};
+use tauri::{Emitter, Manager};
 
 use crate::{
     crypto::{self, KeyPair},
@@ -20,13 +21,22 @@ use crate::{
 };
 
 const PROTOCOL: &str = "file-sharer.v2";
+const GOODBYE_PROTOCOL: &str = "file-sharer.v2.goodbye";
+const PROBE_PROTOCOL: &str = "file-sharer.v2.probe";
 const DISCOVERY_PORT: u16 = 45891;
 const TRANSFER_PORT: u16 = 45892;
-const DEVICE_TTL_MS: u128 = 12_000;
-const BEACON_INTERVAL: Duration = Duration::from_secs(2);
+const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
+const DEVICE_TTL_MS: u128 = 6_000;
+const BEACON_INTERVAL_FAST: Duration = Duration::from_millis(500);
+const BEACON_INTERVAL_SLOW: Duration = Duration::from_secs(5);
+const BEACON_BACKOFF_THRESHOLD_MS: u128 = 30_000;
 const MAX_TRANSFER_HISTORY: usize = 100;
 const TRANSFER_CHUNK_SIZE: usize = 64 * 1024;
 const TRANSFER_PROGRESS_EVENT: &str = "transfer-progress";
+const DEVICE_DISCOVERED_EVENT: &str = "device-discovered";
+const DEVICE_LOST_EVENT: &str = "device-lost";
+const DISCOVERY_BURST_COUNT: usize = 5;
+const DISCOVERY_BURST_INTERVAL: Duration = Duration::from_millis(60);
 
 #[derive(Clone)]
 pub struct NetworkService {
@@ -35,8 +45,12 @@ pub struct NetworkService {
     state: Arc<Mutex<NetworkState>>,
     receive_dir: Arc<Mutex<Option<PathBuf>>>,
     history: Arc<Mutex<Vec<TransferEvent>>>,
+    history_path: Arc<Mutex<Option<PathBuf>>>,
     app: Arc<Mutex<Option<tauri::AppHandle>>>,
     cancelled_transfers: Arc<Mutex<HashSet<String>>>,
+    progress_timestamps: Arc<Mutex<HashMap<String, (u128, u64)>>>,
+    discovery_enabled: Arc<Mutex<bool>>,
+    last_new_device_ms: Arc<Mutex<u128>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,7 +80,7 @@ pub struct TransferReceipt {
     pub bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransferEvent {
     pub direction: TransferDirection,
     pub file_name: String,
@@ -87,16 +101,18 @@ pub struct TransferProgress {
     pub total_bytes: u64,
     pub encrypted: bool,
     pub error: Option<String>,
+    pub speed_mbps: f64,
+    pub eta_seconds: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransferDirection {
     Sent,
     Received,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum TransferPhase {
     Started,
@@ -113,6 +129,17 @@ struct Beacon {
     platform: String,
     port: u16,
     crypto_public_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Goodbye {
+    protocol: String,
+    id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Probe {
+    protocol: String,
 }
 
 #[derive(Default)]
@@ -134,14 +161,19 @@ impl NetworkService {
             crypto_public_key: key_pair.public_header(),
         };
 
+        let now = now_ms();
         Arc::new(Self {
             identity: Arc::new(Mutex::new(identity)),
             key_pair,
             state: Arc::new(Mutex::new(NetworkState::default())),
             receive_dir: Arc::new(Mutex::new(None)),
             history: Arc::new(Mutex::new(Vec::new())),
+            history_path: Arc::new(Mutex::new(None)),
             app: Arc::new(Mutex::new(None)),
             cancelled_transfers: Arc::new(Mutex::new(HashSet::new())),
+            progress_timestamps: Arc::new(Mutex::new(HashMap::new())),
+            discovery_enabled: Arc::new(Mutex::new(true)),
+            last_new_device_ms: Arc::new(Mutex::new(now)),
         })
     }
 
@@ -152,13 +184,24 @@ impl NetworkService {
 
     pub fn set_app_handle(&self, app: tauri::AppHandle) {
         let mut configured_app = self.app.lock().expect("app handle poisoned");
-        *configured_app = Some(app);
+        *configured_app = Some(app.clone());
+
+        // Set up history file path in app_data_dir
+        if let Ok(app_data_dir) = app.path().app_data_dir() {
+            let history_file: PathBuf = app_data_dir.join("transfer_history.json");
+            if let Ok(mut path) = self.history_path.lock() {
+                *path = Some(history_file.clone());
+            }
+            // Load existing history
+            self.load_history(&history_file);
+        }
     }
 
     pub fn start(self: &Arc<Self>) {
         self.start_discovery_listener();
         self.start_beacon_loop();
         self.start_transfer_listener();
+        self.start_ttl_cleanup_loop();
     }
 
     pub fn identity(&self) -> Identity {
@@ -182,10 +225,23 @@ impl NetworkService {
     pub fn devices(&self) -> Vec<DeviceInfo> {
         let now = now_ms();
         let mut state = self.state.lock().expect("network state poisoned");
+        let lost_ids: Vec<String> = state
+            .devices
+            .iter()
+            .filter(|(_, device)| now.saturating_sub(device.last_seen_ms) > DEVICE_TTL_MS)
+            .map(|(id, _)| id.clone())
+            .collect();
+
         state
             .devices
             .retain(|_, device| now.saturating_sub(device.last_seen_ms) <= DEVICE_TTL_MS);
+        drop(state);
 
+        for id in &lost_ids {
+            self.emit_device_lost(id.clone());
+        }
+
+        let state = self.state.lock().expect("network state poisoned");
         let mut devices = state.devices.values().cloned().collect::<Vec<_>>();
         devices.sort_by(|left, right| left.name.cmp(&right.name));
         devices
@@ -206,6 +262,7 @@ impl NetworkService {
             .lock()
             .expect("transfer history poisoned")
             .clear();
+        self.save_history();
     }
 
     pub fn record_sent_transfer(&self, file_name: String, peer_name: String, bytes: u64) {
@@ -223,6 +280,93 @@ impl NetworkService {
         if let Ok(mut cancelled_transfers) = self.cancelled_transfers.lock() {
             cancelled_transfers.insert(transfer_id);
         }
+    }
+
+    pub fn set_discovery_enabled(&self, enabled: bool) {
+        let mut discovery = self.discovery_enabled.lock().expect("discovery state poisoned");
+        let was_enabled = *discovery;
+        *discovery = enabled;
+        drop(discovery);
+        if enabled {
+            let mut last_new = self.last_new_device_ms.lock().expect("last_new_device_ms poisoned");
+            *last_new = now_ms();
+            drop(last_new);
+            self.broadcast_beacon();
+        } else if was_enabled {
+            self.broadcast_goodbye();
+        }
+    }
+
+    fn broadcast_beacon(&self) {
+        if let Ok(payload) = serde_json::to_vec(&self.beacon()) {
+            Self::send_discovery_burst(payload, "beacon");
+        }
+    }
+
+    fn broadcast_probe(&self) {
+        let probe = Probe {
+            protocol: PROBE_PROTOCOL.to_string(),
+        };
+        if let Ok(payload) = serde_json::to_vec(&probe) {
+            Self::send_discovery_burst(payload, "probe");
+        }
+    }
+
+    fn broadcast_goodbye(&self) {
+        let identity = self.identity();
+        let goodbye = Goodbye {
+            protocol: GOODBYE_PROTOCOL.to_string(),
+            id: identity.id,
+        };
+        if let Ok(payload) = serde_json::to_vec(&goodbye) {
+            Self::send_discovery_burst(payload, "goodbye");
+        }
+    }
+
+    fn send_discovery_burst(payload: Vec<u8>, label: &'static str) {
+        thread::spawn(move || {
+            let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    eprintln!("{label} bind failed: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = socket.set_broadcast(true) {
+                eprintln!("{label} set_broadcast failed: {error}");
+            }
+            let targets = discovery_targets();
+            for _ in 0..DISCOVERY_BURST_COUNT {
+                for target in &targets {
+                    if let Err(error) = socket.send_to(&payload, target) {
+                        eprintln!("{label} send to {target} failed: {error}");
+                    }
+                }
+                thread::sleep(DISCOVERY_BURST_INTERVAL);
+            }
+        });
+    }
+
+    pub fn is_discovery_enabled(&self) -> bool {
+        *self.discovery_enabled.lock().expect("discovery state poisoned")
+    }
+
+    pub fn probe_discovery(&self) {
+        let lost_ids = self.clear_devices();
+        for id in lost_ids {
+            self.emit_device_lost(id);
+        }
+        if self.is_discovery_enabled() {
+            self.broadcast_beacon();
+        }
+        self.broadcast_probe();
+    }
+
+    fn clear_devices(&self) -> Vec<String> {
+        let mut state = self.state.lock().expect("network state poisoned");
+        let lost_ids = state.devices.keys().cloned().collect::<Vec<_>>();
+        state.devices.clear();
+        lost_ids
     }
 
     pub fn send_files(
@@ -300,6 +444,8 @@ impl NetworkService {
             total_bytes: metadata.len(),
             encrypted: true,
             error: None,
+            speed_mbps: 0.0,
+            eta_seconds: 0,
         });
 
         let plaintext_mac = match self.file_mac(
@@ -324,6 +470,8 @@ impl NetworkService {
                     total_bytes: metadata.len(),
                     encrypted: true,
                     error: Some(error.clone()),
+                    speed_mbps: 0.0,
+                    eta_seconds: 0,
                 });
                 return Err(error);
             }
@@ -372,6 +520,8 @@ impl NetworkService {
                     total_bytes: metadata.len(),
                     encrypted: true,
                     error: Some(error.clone()),
+                    speed_mbps: 0.0,
+                    eta_seconds: 0,
                 });
                 error
             })?;
@@ -398,6 +548,8 @@ impl NetworkService {
                 total_bytes: metadata.len(),
                 encrypted: true,
                 error: None,
+                speed_mbps: 0.0,
+                eta_seconds: 0,
             });
         }
 
@@ -419,6 +571,8 @@ impl NetworkService {
                 total_bytes: metadata.len(),
                 encrypted: true,
                 error: Some(error.clone()),
+                speed_mbps: 0.0,
+                eta_seconds: 0,
             });
             return Err(error);
         }
@@ -442,6 +596,8 @@ impl NetworkService {
             total_bytes: metadata.len(),
             encrypted: true,
             error: None,
+            speed_mbps: 0.0,
+            eta_seconds: 0,
         });
 
         Ok(TransferReceipt {
@@ -490,6 +646,8 @@ impl NetworkService {
                     total_bytes,
                     encrypted: true,
                     error: None,
+                    speed_mbps: 0.0,
+                    eta_seconds: 0,
                 });
             }
         }
@@ -500,16 +658,13 @@ impl NetworkService {
     fn start_discovery_listener(self: &Arc<Self>) {
         let service = self.clone();
         thread::spawn(move || {
-            let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT)) {
+            let socket = match discovery_socket() {
                 Ok(socket) => socket,
                 Err(error) => {
                     eprintln!("discovery bind failed: {error}");
                     return;
                 }
             };
-            if let Err(error) = socket.set_broadcast(true) {
-                eprintln!("enable discovery broadcast failed: {error}");
-            }
             let mut buffer = [0_u8; 2048];
 
             loop {
@@ -520,6 +675,37 @@ impl NetworkService {
                     continue;
                 }
 
+                if let Ok(probe) = serde_json::from_slice::<Probe>(&buffer[..size]) {
+                    if probe.protocol == PROBE_PROTOCOL {
+                        let discovery_enabled = service
+                            .discovery_enabled
+                            .lock()
+                            .expect("discovery state poisoned");
+                        if *discovery_enabled {
+                            let reply_to = SocketAddr::new(source.ip(), DISCOVERY_PORT);
+                            if let Ok(payload) = serde_json::to_vec(&service.beacon()) {
+                                let _ = socket.send_to(&payload, reply_to);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // 处理 Goodbye 包（设备主动下线）
+                if let Ok(goodbye) = serde_json::from_slice::<Goodbye>(&buffer[..size]) {
+                    if goodbye.protocol == GOODBYE_PROTOCOL {
+                        if goodbye.id != service.identity().id {
+                            let mut state = service.state.lock().expect("network state poisoned");
+                            let removed = state.devices.remove(&goodbye.id).is_some();
+                            drop(state);
+                            if removed {
+                                service.emit_device_lost(goodbye.id);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 let Ok(beacon) = serde_json::from_slice::<Beacon>(&buffer[..size]) else {
                     continue;
                 };
@@ -528,24 +714,33 @@ impl NetworkService {
                     continue;
                 }
 
-                if let Ok(payload) = serde_json::to_vec(&service.beacon()) {
-                    let reply_to = SocketAddr::new(source.ip(), DISCOVERY_PORT);
-                    let _ = socket.send_to(&payload, reply_to);
+                let mut state = service.state.lock().expect("network state poisoned");
+                let is_new = !state.devices.contains_key(&beacon.id);
+                let device_info = DeviceInfo {
+                    id: beacon.id.clone(),
+                    name: beacon.name.clone(),
+                    platform: beacon.platform.clone(),
+                    address: source.ip().to_string(),
+                    port: beacon.port,
+                    last_seen_ms: now_ms(),
+                    crypto_public_key: beacon.crypto_public_key.clone(),
+                };
+                state.devices.insert(beacon.id.clone(), device_info.clone());
+                drop(state);
+
+                if is_new {
+                    service.emit_device_discovered(device_info);
+                    let mut last_new = service.last_new_device_ms.lock().expect("last_new_device_ms poisoned");
+                    *last_new = now_ms();
                 }
 
-                let mut state = service.state.lock().expect("network state poisoned");
-                state.devices.insert(
-                    beacon.id.clone(),
-                    DeviceInfo {
-                        id: beacon.id,
-                        name: beacon.name,
-                        platform: beacon.platform,
-                        address: source.ip().to_string(),
-                        port: beacon.port,
-                        last_seen_ms: now_ms(),
-                        crypto_public_key: beacon.crypto_public_key,
-                    },
-                );
+                let discovery_enabled = service.discovery_enabled.lock().expect("discovery state poisoned");
+                if *discovery_enabled {
+                    let reply_to = SocketAddr::new(source.ip(), DISCOVERY_PORT);
+                    if let Ok(payload) = serde_json::to_vec(&service.beacon()) {
+                        let _ = socket.send_to(&payload, reply_to);
+                    }
+                }
             }
         });
     }
@@ -566,13 +761,27 @@ impl NetworkService {
             }
 
             loop {
-                if let Ok(payload) = serde_json::to_vec(&service.beacon()) {
-                    let _ = socket.send_to(
-                        &payload,
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DISCOVERY_PORT),
-                    );
+                let discovery_enabled = service.discovery_enabled.lock().expect("discovery state poisoned");
+                if !*discovery_enabled {
+                    drop(discovery_enabled);
+                    thread::sleep(BEACON_INTERVAL_FAST);
+                    continue;
                 }
-                thread::sleep(BEACON_INTERVAL);
+                drop(discovery_enabled);
+
+                if let Ok(payload) = serde_json::to_vec(&service.beacon()) {
+                    for target in discovery_targets() {
+                        let _ = socket.send_to(&payload, target);
+                    }
+                }
+
+                let last_new = *service.last_new_device_ms.lock().expect("last_new_device_ms poisoned");
+                let interval = if now_ms().saturating_sub(last_new) > BEACON_BACKOFF_THRESHOLD_MS {
+                    BEACON_INTERVAL_SLOW
+                } else {
+                    BEACON_INTERVAL_FAST
+                };
+                thread::sleep(interval);
             }
         });
     }
@@ -587,6 +796,16 @@ impl NetworkService {
             port: identity.port,
             crypto_public_key: identity.crypto_public_key,
         }
+    }
+
+    fn start_ttl_cleanup_loop(self: &Arc<Self>) {
+        let service = self.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let _ = service.devices();
+            }
+        });
     }
 
     fn start_transfer_listener(self: &Arc<Self>) {
@@ -706,6 +925,8 @@ impl NetworkService {
             total_bytes: content_length,
             encrypted: true,
             error: None,
+            speed_mbps: 0.0,
+            eta_seconds: 0,
         });
 
         let mut output = match File::create(&destination) {
@@ -743,6 +964,8 @@ impl NetworkService {
                     total_bytes: content_length,
                     encrypted: true,
                     error: Some("传输已取消".to_string()),
+                    speed_mbps: 0.0,
+                    eta_seconds: 0,
                 });
                 return write_response(
                     reader.into_inner(),
@@ -775,6 +998,8 @@ impl NetworkService {
                 total_bytes: content_length,
                 encrypted: true,
                 error: None,
+                speed_mbps: 0.0,
+                eta_seconds: 0,
             });
         }
 
@@ -799,6 +1024,8 @@ impl NetworkService {
                 total_bytes: content_length,
                 encrypted: true,
                 error: Some("加密校验失败".to_string()),
+                speed_mbps: 0.0,
+                eta_seconds: 0,
             });
             return write_response(
                 reader.into_inner(),
@@ -831,6 +1058,8 @@ impl NetworkService {
             total_bytes: content_length,
             encrypted: true,
             error: None,
+            speed_mbps: 0.0,
+            eta_seconds: 0,
         });
 
         let response_body = format!(
@@ -859,12 +1088,108 @@ impl NetworkService {
             let overflow = history.len() - MAX_TRANSFER_HISTORY;
             history.drain(0..overflow);
         }
+        drop(history);
+        self.save_history();
     }
 
-    fn emit_progress(&self, progress: TransferProgress) {
+    fn load_history(&self, path: &PathBuf) {
+        if !path.exists() {
+            return;
+        }
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                if let Ok(loaded) = serde_json::from_str::<Vec<TransferEvent>>(&content) {
+                    let mut history = self.history.lock().expect("transfer history poisoned");
+                    *history = loaded;
+                    if history.len() > MAX_TRANSFER_HISTORY {
+                        let overflow = history.len() - MAX_TRANSFER_HISTORY;
+                        history.drain(0..overflow);
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("Failed to load transfer history: {}", error);
+            }
+        }
+    }
+
+    fn save_history(&self) {
+        let path = match self.history_path.lock() {
+            Ok(path) => path.clone(),
+            Err(_) => return,
+        };
+        let path = match path {
+            Some(path) => path,
+            None => return,
+        };
+        let history = match self.history.lock() {
+            Ok(history) => history.clone(),
+            Err(_) => return,
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                eprintln!("Failed to create history directory: {}", error);
+                return;
+            }
+        }
+        match serde_json::to_string_pretty(&history) {
+            Ok(content) => {
+                if let Err(error) = fs::write(&path, content) {
+                    eprintln!("Failed to save transfer history: {}", error);
+                }
+            }
+            Err(error) => {
+                eprintln!("Failed to serialize transfer history: {}", error);
+            }
+        }
+    }
+
+    fn emit_progress(&self, mut progress: TransferProgress) {
+        let now = now_ms();
+        let mut timestamps = self.progress_timestamps.lock().expect("progress timestamps poisoned");
+
+        if progress.phase == TransferPhase::Started {
+            timestamps.insert(progress.transfer_id.clone(), (now, progress.bytes_transferred));
+        } else if progress.phase == TransferPhase::Progress {
+            if let Some((last_time, last_bytes)) = timestamps.get(&progress.transfer_id) {
+                let time_delta_ms = now.saturating_sub(*last_time) as f64;
+                let bytes_delta = progress.bytes_transferred.saturating_sub(*last_bytes) as f64;
+
+                if time_delta_ms > 100.0 && bytes_delta > 0.0 {
+                    let speed_bps = bytes_delta / (time_delta_ms / 1000.0);
+                    progress.speed_mbps = speed_bps / (1024.0 * 1024.0);
+
+                    let remaining_bytes = progress.total_bytes.saturating_sub(progress.bytes_transferred) as f64;
+                    if speed_bps > 0.0 {
+                        progress.eta_seconds = (remaining_bytes / speed_bps) as u64;
+                    }
+
+                    timestamps.insert(progress.transfer_id.clone(), (now, progress.bytes_transferred));
+                }
+            }
+        } else if progress.phase == TransferPhase::Finished || progress.phase == TransferPhase::Failed {
+            timestamps.remove(&progress.transfer_id);
+        }
+
+        drop(timestamps);
+
         let app = self.app.lock().expect("app handle poisoned").clone();
         if let Some(app) = app {
             let _ = app.emit(TRANSFER_PROGRESS_EVENT, progress);
+        }
+    }
+
+    fn emit_device_discovered(&self, device: DeviceInfo) {
+        let app = self.app.lock().expect("app handle poisoned").clone();
+        if let Some(app) = app {
+            let _ = app.emit(DEVICE_DISCOVERED_EVENT, device);
+        }
+    }
+
+    fn emit_device_lost(&self, device_id: String) {
+        let app = self.app.lock().expect("app handle poisoned").clone();
+        if let Some(app) = app {
+            let _ = app.emit(DEVICE_LOST_EVENT, device_id);
         }
     }
 
@@ -901,6 +1226,74 @@ fn read_headers(reader: &mut BufReader<TcpStream>) -> io::Result<HashMap<String,
 
 fn header_value(headers: &HashMap<String, String>, name: &str) -> Option<String> {
     headers.get(name).cloned()
+}
+
+fn discovery_socket() -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_broadcast(true)?;
+    socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DISCOVERY_PORT).into())?;
+    socket.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)?;
+    Ok(socket.into())
+}
+
+fn discovery_targets() -> Vec<SocketAddr> {
+    let mut targets = vec![
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DISCOVERY_PORT),
+        SocketAddr::new(IpAddr::V4(MULTICAST_ADDR), DISCOVERY_PORT),
+    ];
+
+    targets.extend(ipv4_broadcast_addresses().into_iter().map(|address| {
+        SocketAddr::new(IpAddr::V4(address), DISCOVERY_PORT)
+    }));
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+#[cfg(not(target_os = "android"))]
+fn ipv4_broadcast_addresses() -> Vec<Ipv4Addr> {
+    Vec::new()
+}
+
+#[cfg(target_os = "android")]
+fn ipv4_broadcast_addresses() -> Vec<Ipv4Addr> {
+    use std::ffi::CStr;
+    use std::ptr;
+
+    let mut addresses = Vec::new();
+    unsafe {
+        let mut ifaddr: *mut libc::ifaddrs = ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddr) != 0 {
+            return addresses;
+        }
+
+        let mut cursor = ifaddr;
+        while !cursor.is_null() {
+            let item = &*cursor;
+            if !item.ifa_addr.is_null()
+                && !item.ifa_netmask.is_null()
+                && (*item.ifa_addr).sa_family as i32 == libc::AF_INET
+                && (item.ifa_flags & libc::IFF_UP as u32) != 0
+                && (item.ifa_flags & libc::IFF_LOOPBACK as u32) == 0
+            {
+                let name = CStr::from_ptr(item.ifa_name);
+                if name.to_bytes().starts_with(b"wlan") || name.to_bytes().starts_with(b"ap") {
+                    let addr = *(item.ifa_addr as *const libc::sockaddr_in);
+                    let mask = *(item.ifa_netmask as *const libc::sockaddr_in);
+                    let ip = u32::from_be(addr.sin_addr.s_addr);
+                    let netmask = u32::from_be(mask.sin_addr.s_addr);
+                    let broadcast = Ipv4Addr::from((ip | !netmask).to_be_bytes());
+                    addresses.push(broadcast);
+                }
+            }
+            cursor = item.ifa_next;
+        }
+        libc::freeifaddrs(ifaddr);
+    }
+    addresses
 }
 
 fn write_response(mut stream: TcpStream, status: u16, text: &str, body: &str) -> io::Result<()> {

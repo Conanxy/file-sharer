@@ -48,6 +48,8 @@ type TransferProgress = {
   total_bytes: number;
   encrypted: boolean;
   error?: string | null;
+  speed_mbps: number;
+  eta_seconds: number;
 };
 
 const DEFAULT_TARGET_KEY = "file-sharer.default-target";
@@ -81,11 +83,28 @@ let statusText = "等待发现局域网设备";
 let transferHistory: TransferEvent[] = [];
 let activeTransfers: TransferProgress[] = [];
 const progressClearTimers = new Map<string, number>();
-let overlayMode: "normal" | "drag" | "transfer" = "normal";
+type OverlayMode = "normal" | "drag" | "transfer" | "confirm";
+
+let overlayMode: OverlayMode = "normal";
 const sendQueue: string[][] = [];
 let isSendingQueue = false;
 let activeView: AppView = "send";
 let receiveDirText = "下载/File Sharer";
+let dragSendImmediately = true;
+let lanDiscoveryEnabled = true;
+let pendingSendPaths: string[] = [];
+let lastHandledDropSignature = "";
+let lastHandledDropAt = 0;
+let confirmRefreshTimer: number | null = null;
+let lastOverlaySizeKey = "";
+let shouldRepositionConfirmOverlay = false;
+let lastDevicesRenderSignature = "";
+let lastConfirmRenderSignature = "";
+let lastConfirmFilesSignature = "";
+let lastConfirmTargetSignature = "";
+let lastSendTargetSelectSignature = "";
+let lastSettingsTargetSelectSignature = "";
+let confirmExpandTimer: number | null = null;
 
 app.innerHTML = `
   <section class="app-shell" id="main-shell">
@@ -132,6 +151,15 @@ app.innerHTML = `
           <select id="target-select"></select>
         </section>
 
+        <section class="devices-head">
+          <span>局域网设备</span>
+          <button class="icon-button" id="refresh-devices" type="button" title="刷新设备列表">
+            <svg class="refresh-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 12a8 8 0 0 1-13.7 5.7M4 12A8 8 0 0 1 17.7 6.3" />
+              <path d="M7 18H4v3M17 6h3V3" />
+            </svg>
+          </button>
+        </section>
         <section class="devices" id="devices"></section>
         <section class="progress-wrap" id="progress-wrap"></section>
       </section>
@@ -176,10 +204,20 @@ app.innerHTML = `
           <div class="setting-row">
             <span>
               <strong>局域网发现</strong>
-              <small>仅在当前局域网广播与接收</small>
+              <small id="lan-discovery-status">开启中 · 可被发现</small>
             </span>
             <label class="switch">
-              <input type="checkbox" checked disabled />
+              <input type="checkbox" id="lan-discovery" checked />
+              <span></span>
+            </label>
+          </div>
+          <div class="setting-row desktop-only">
+            <span>
+              <strong>拖放后立即发送</strong>
+              <small>关闭后拖放文件需确认再发送</small>
+            </span>
+            <label class="switch">
+              <input type="checkbox" id="drag-send-immediately" checked />
               <span></span>
             </label>
           </div>
@@ -195,6 +233,19 @@ app.innerHTML = `
     </main>
   </section>
 
+  <section class="modal-overlay" id="modal-overlay" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <strong id="modal-title">确认</strong>
+      </div>
+      <p class="modal-body" id="modal-body">确定要执行此操作吗？</p>
+      <div class="modal-actions">
+        <button class="text-button" id="modal-cancel" type="button">取消</button>
+        <button class="text-button primary" id="modal-confirm" type="button">确认</button>
+      </div>
+    </div>
+  </section>
+
   <section class="overlay-shell" id="overlay-shell">
     <section class="drag-mini" id="drag-mini">
       <div class="drag-card">
@@ -205,7 +256,28 @@ app.innerHTML = `
         <div class="drag-local">
           <small id="drag-target-meta">等待局域网设备</small>
         </div>
-        <span class="drag-hint">松开鼠标开始传输</span>
+        <span class="drag-hint" id="drag-hint">松开鼠标开始传输</span>
+      </div>
+    </section>
+    <section class="overlay-confirm" id="overlay-confirm">
+      <div class="confirm-card">
+        <div class="confirm-main">
+          <div class="confirm-head">
+            <strong>确认发送</strong>
+            <small id="confirm-file-count">0 个文件</small>
+          </div>
+          <div class="confirm-files" id="confirm-files"></div>
+        </div>
+        <div class="confirm-footer">
+          <div class="confirm-target">
+            <label for="confirm-target-select">目标设备</label>
+            <select id="confirm-target-select"></select>
+          </div>
+          <div class="confirm-actions">
+            <button class="text-button" id="confirm-cancel" type="button">取消</button>
+            <button class="text-button primary" id="confirm-send" type="button">发送</button>
+          </div>
+        </div>
       </div>
     </section>
     <section class="overlay-progress" id="overlay-progress"></section>
@@ -227,8 +299,16 @@ const settingsTargetSelect = document.querySelector<HTMLSelectElement>("#setting
 const devicesElement = document.querySelector<HTMLElement>("#devices")!;
 const dragTarget = document.querySelector<HTMLElement>("#drag-target")!;
 const dragTargetMeta = document.querySelector<HTMLElement>("#drag-target-meta")!;
+const dragHint = document.querySelector<HTMLElement>("#drag-hint")!;
 const progressElement = document.querySelector<HTMLElement>("#progress-wrap")!;
 const overlayProgressElement = document.querySelector<HTMLElement>("#overlay-progress")!;
+const overlayConfirmElement = document.querySelector<HTMLElement>("#overlay-confirm")!;
+const confirmFilesElement = document.querySelector<HTMLElement>("#confirm-files")!;
+const confirmFileCountElement = document.querySelector<HTMLElement>("#confirm-file-count")!;
+const confirmTargetSelect = document.querySelector<HTMLSelectElement>("#confirm-target-select")!;
+const confirmCancelButton = document.querySelector<HTMLButtonElement>("#confirm-cancel")!;
+const confirmSendButton = document.querySelector<HTMLButtonElement>("#confirm-send")!;
+const confirmHead = document.querySelector<HTMLElement>(".confirm-head")!;
 const historyElement = document.querySelector<HTMLElement>("#history")!;
 const historyCountElement = document.querySelector<HTMLElement>("#history-count")!;
 const statusElement = document.querySelector<HTMLElement>("#status")!;
@@ -236,6 +316,14 @@ const viewTitle = document.querySelector<HTMLElement>("#view-title")!;
 const viewKicker = document.querySelector<HTMLElement>("#view-kicker")!;
 const defaultTargetLabel = document.querySelector<HTMLElement>("#default-target-label")!;
 const receiveDirElement = document.querySelector<HTMLElement>("#receive-dir")!;
+const dragSendImmediatelyCheckbox = document.querySelector<HTMLInputElement>("#drag-send-immediately")!;
+const lanDiscoveryCheckbox = document.querySelector<HTMLInputElement>("#lan-discovery")!;
+const lanDiscoveryStatus = document.querySelector<HTMLElement>("#lan-discovery-status")!;
+const modalOverlay = document.querySelector<HTMLElement>("#modal-overlay")!;
+const modalTitle = document.querySelector<HTMLElement>("#modal-title")!;
+const modalBody = document.querySelector<HTMLElement>("#modal-body")!;
+const modalCancel = document.querySelector<HTMLButtonElement>("#modal-cancel")!;
+const modalConfirm = document.querySelector<HTMLButtonElement>("#modal-confirm")!;
 const openDirButtons = [
   document.querySelector<HTMLButtonElement>("#open-dir")!,
   document.querySelector<HTMLButtonElement>("#open-dir-secondary")!,
@@ -244,6 +332,7 @@ const clearHistoryButtons = [
   document.querySelector<HTMLButtonElement>("#clear-history")!,
   document.querySelector<HTMLButtonElement>("#clear-history-secondary")!,
 ];
+const refreshDevicesButton = document.querySelector<HTMLButtonElement>("#refresh-devices");
 
 function setStatus(text: string) {
   statusText = text;
@@ -260,6 +349,9 @@ function render() {
   renderDevices();
   renderProgress();
   renderHistory();
+  if (pendingSendPaths.length > 0) {
+    renderConfirmPanel(false);
+  }
 
   if (!isOverlayWindow) {
     dropZone.classList.toggle("active", isDropActive);
@@ -269,19 +361,41 @@ function render() {
 
 function renderWindowMode() {
   const hasActiveTransfer = activeTransfers.length > 0;
+  const showConfirm = pendingSendPaths.length > 0;
   const showTransferShell = hasActiveTransfer || overlayMode === "transfer";
-  const showDragMini = isDropActive && !showTransferShell;
+  const showDragMini = isDropActive && !showTransferShell && !showConfirm;
   mainShell.hidden = isOverlayWindow;
   overlayShell.hidden = !isOverlayWindow;
   overlayShell.classList.toggle("transfer", showTransferShell);
   overlayShell.classList.toggle("dragging", showDragMini);
+  overlayShell.classList.toggle("confirm", showConfirm);
+  if (!showConfirm) {
+    overlayShell.classList.remove("confirm-enter");
+  }
   if (!isOverlayWindow) {
-    syncOverlayMode(showTransferShell ? "transfer" : showDragMini ? "drag" : overlayMode);
+    syncOverlayMode(showConfirm ? "confirm" : showTransferShell ? "transfer" : showDragMini ? "drag" : overlayMode);
   }
   if (isOverlayWindow) {
-    getCurrentWindow()
-      .setSize(new LogicalSize(456, showTransferShell ? 128 : 116))
-      .catch(() => {});
+    const width = showConfirm || showDragMini ? 560 : 456;
+    let height = showDragMini ? 300 : 116;
+    if (showConfirm) height = 300;
+    else if (showTransferShell) height = 128;
+    const sizeKey = `${width}x${height}`;
+    if (lastOverlaySizeKey !== sizeKey) {
+      lastOverlaySizeKey = sizeKey;
+      getCurrentWindow()
+        .setSize(new LogicalSize(width, height))
+        .then(() => {
+          if (shouldRepositionConfirmOverlay) {
+            shouldRepositionConfirmOverlay = false;
+            return tauriInvoke("position_overlay");
+          }
+        })
+        .catch(() => {});
+    } else if (shouldRepositionConfirmOverlay) {
+      shouldRepositionConfirmOverlay = false;
+      tauriInvoke("position_overlay").catch(() => {});
+    }
   }
 }
 
@@ -315,6 +429,7 @@ function renderIdentity() {
   dragTargetMeta.textContent = target
     ? `${target.platform} · ${target.address}`
     : "等待局域网设备";
+  dragHint.textContent = dragSendImmediately ? "松开鼠标开始传输" : "松开鼠标添加到待发送";
   if (identity && document.activeElement !== nameInput) {
     nameInput.value = identity.name;
   }
@@ -334,11 +449,23 @@ function renderTargets() {
     secondaryOpenButton.textContent = isMobileRuntime ? "打开下载" : "打开";
   }
 
-  renderTargetSelect(targetSelect, "发送前选择");
-  renderTargetSelect(settingsTargetSelect, "最近使用的设备");
+  lastSendTargetSelectSignature = renderTargetSelect(
+    targetSelect,
+    "发送前选择",
+    lastSendTargetSelectSignature,
+  );
+  lastSettingsTargetSelectSignature = renderTargetSelect(
+    settingsTargetSelect,
+    "最近使用的设备",
+    lastSettingsTargetSelectSignature,
+  );
 }
 
-function renderTargetSelect(select: HTMLSelectElement, placeholderText: string) {
+function renderTargetSelect(select: HTMLSelectElement, placeholderText: string, previousSignature = "") {
+  const signature = targetSelectSignature(placeholderText);
+  if (signature === previousSignature) {
+    return previousSignature;
+  }
   select.innerHTML = "";
   const placeholder = document.createElement("option");
   placeholder.value = "";
@@ -357,9 +484,27 @@ function renderTargetSelect(select: HTMLSelectElement, placeholderText: string) 
   } else {
     select.value = "";
   }
+  return signature;
+}
+
+function targetSelectSignature(placeholderText: string) {
+  return [
+    selectedTargetId,
+    placeholderText,
+    ...devices.map((device) => [
+      device.id,
+      device.name,
+      device.platform,
+    ].join("|")),
+  ].join("\n");
 }
 
 function renderDevices() {
+  const signature = deviceListSignature();
+  if (signature === lastDevicesRenderSignature) {
+    return;
+  }
+  lastDevicesRenderSignature = signature;
   devicesElement.innerHTML = "";
   if (devices.length === 0) {
     const empty = document.createElement("p");
@@ -384,6 +529,19 @@ function renderDevices() {
   }
 }
 
+function deviceListSignature() {
+  return [
+    selectedTargetId,
+    ...devices.map((device) => [
+      device.id,
+      device.name,
+      device.platform,
+      device.address,
+      device.port,
+    ].join("|")),
+  ].join("\n");
+}
+
 function renderProgress() {
   progressElement.innerHTML = "";
   overlayProgressElement.innerHTML = "";
@@ -395,18 +553,28 @@ function renderProgress() {
       : 0;
     const direction = progress.direction === "received" ? "接收" : "发送";
     const peer = progress.direction === "received" ? `来自 ${progress.peer_name}` : `到 ${progress.peer_name}`;
-    const state = progress.phase === "failed"
+
+    let state = progress.phase === "failed"
       ? "失败"
       : progress.phase === "finished"
         ? "完成"
         : `${value}%`;
+
+    let speedInfo = "";
+    if (progress.phase === "progress" && progress.speed_mbps > 0) {
+      speedInfo = ` · ${progress.speed_mbps.toFixed(1)} MB/s`;
+      if (progress.eta_seconds > 0) {
+        speedInfo += ` · 剩余 ${formatEta(progress.eta_seconds)}`;
+      }
+    }
+
     const item = document.createElement("section");
     item.className = `progress-item ${progress.direction} ${progress.phase}`;
     item.innerHTML = `
       <div class="progress-row">
         <span>
           <strong>${direction} ${escapeHtml(progress.file_name)}</strong>
-          <small>${escapeHtml(peer)} · ${formatBytes(progress.bytes_transferred)} / ${formatBytes(progress.total_bytes)} · 加密</small>
+          <small>${escapeHtml(peer)} · ${formatBytes(progress.bytes_transferred)} / ${formatBytes(progress.total_bytes)}${speedInfo}</small>
         </span>
         <button class="cancel-transfer" type="button" data-transfer-id="${escapeHtml(progress.transfer_id)}">×</button>
         <em>${escapeHtml(state)}</em>
@@ -472,9 +640,7 @@ function escapeHtml(value: string) {
 
 function setDefaultTarget(deviceId: string) {
   selectedTargetId = deviceId;
-  if (!isOverlayWindow) {
-    localStorage.setItem(DEFAULT_TARGET_KEY, deviceId);
-  }
+  localStorage.setItem(DEFAULT_TARGET_KEY, deviceId);
   const device = devices.find((item) => item.id === deviceId);
   setStatus(device ? `默认目标：${device.name}` : "默认目标已更新");
   render();
@@ -514,9 +680,23 @@ function currentTarget() {
 }
 
 async function refreshDevices() {
+  return refreshDevicesWithOptions();
+}
+
+async function refreshDevicesForConfirm() {
+  return refreshDevicesWithOptions({ probe: true, preserveMissingTarget: true, quiet: true });
+}
+
+async function refreshDevicesWithOptions(options: { probe?: boolean; preserveMissingTarget?: boolean; quiet?: boolean } = {}) {
   try {
+    if (isTauriRuntime && options.probe !== false) {
+      await tauriInvoke("probe_discovery");
+      await new Promise((resolve) => window.setTimeout(resolve, 180));
+    }
     devices = await tauriInvoke<DeviceInfo[]>("list_devices");
-    if (selectedTargetId && !devices.some((device) => device.id === selectedTargetId)) {
+    if (selectedTargetId && !devices.some((device) => device.id === selectedTargetId) && !options.preserveMissingTarget) {
+      selectedTargetId = "";
+      localStorage.removeItem(DEFAULT_TARGET_KEY);
       setStatus("默认目标暂时离线");
     } else if (!selectedTargetId && devices.length === 1) {
       selectedTargetId = devices[0].id;
@@ -527,7 +707,30 @@ async function refreshDevices() {
     }
     render();
   } catch (error) {
-    setStatus(`设备发现失败：${String(error)}`);
+    if (!options.quiet) {
+      setStatus(`设备发现失败：${String(error)}`);
+    }
+  }
+}
+
+function startConfirmRefresh() {
+  if (!isTauriRuntime || !isOverlayWindow || confirmRefreshTimer !== null) {
+    return;
+  }
+  refreshDevicesForConfirm().catch(() => {});
+  confirmRefreshTimer = window.setInterval(() => {
+    if (pendingSendPaths.length === 0) {
+      stopConfirmRefresh();
+      return;
+    }
+    refreshDevicesForConfirm().catch(() => {});
+  }, 1200);
+}
+
+function stopConfirmRefresh() {
+  if (confirmRefreshTimer !== null) {
+    window.clearInterval(confirmRefreshTimer);
+    confirmRefreshTimer = null;
   }
 }
 
@@ -646,23 +849,29 @@ async function hideOverlaySoon() {
     return;
   }
   window.setTimeout(() => {
-    if (activeTransfers.length === 0 && !isDropActive) {
+    if (activeTransfers.length === 0 && pendingSendPaths.length === 0 && !isDropActive) {
       setOverlayMode("normal").catch(() => {});
       tauriInvoke("hide_overlay").catch(() => {});
     }
   }, 1_600);
 }
 
-async function setOverlayMode(mode: "normal" | "drag" | "transfer") {
+async function setOverlayMode(mode: OverlayMode) {
   if (!canControlDesktopOverlay || overlayMode === mode) {
+    return;
+  }
+  if (pendingSendPaths.length > 0 && (mode === "normal" || mode === "drag")) {
     return;
   }
   overlayMode = mode;
   await tauriInvoke("set_overlay_mode", { mode });
 }
 
-function syncOverlayMode(mode: "normal" | "drag" | "transfer") {
+function syncOverlayMode(mode: OverlayMode) {
   if (!canControlDesktopOverlay || overlayMode === mode) {
+    return;
+  }
+  if (pendingSendPaths.length > 0 && (mode === "normal" || mode === "drag")) {
     return;
   }
   overlayMode = mode;
@@ -771,6 +980,8 @@ async function sendEncryptedBrowserFile(file: File, target: DeviceInfo) {
     total_bytes: file.size,
     encrypted: true,
     error: null,
+    speed_mbps: 0,
+    eta_seconds: 0,
   };
   upsertProgress({
     ...progressBase,
@@ -1173,6 +1384,12 @@ function formatTime(timestampMs: number) {
   });
 }
 
+function formatEta(seconds: number): string {
+  if (seconds < 60) return `${seconds}秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}分${seconds % 60}秒`;
+  return `${Math.floor(seconds / 3600)}时${Math.floor((seconds % 3600) / 60)}分`;
+}
+
 targetSelect.addEventListener("change", () => {
   if (targetSelect.value) {
     setDefaultTarget(targetSelect.value);
@@ -1181,6 +1398,11 @@ targetSelect.addEventListener("change", () => {
 settingsTargetSelect.addEventListener("change", () => {
   if (settingsTargetSelect.value) {
     setDefaultTarget(settingsTargetSelect.value);
+  }
+});
+confirmTargetSelect.addEventListener("change", () => {
+  if (confirmTargetSelect.value) {
+    setDefaultTarget(confirmTargetSelect.value);
   }
 });
 
@@ -1203,6 +1425,171 @@ for (const button of openDirButtons) {
 for (const button of clearHistoryButtons) {
   button.addEventListener("click", () => {
     clearTransferHistory().catch((error) => setStatus(`清空记录失败：${String(error)}`));
+  });
+}
+
+if (refreshDevicesButton) {
+  refreshDevicesButton.addEventListener("click", () => {
+    refreshDevicesButton.classList.add("spinning");
+    const startTime = Date.now();
+    refreshDevices().catch(() => {}).finally(() => {
+      const elapsed = Date.now() - startTime;
+      const minDuration = 500;
+      const cleanup = () => {
+        refreshDevicesButton.classList.remove("spinning");
+      };
+      if (elapsed < minDuration) {
+        window.setTimeout(cleanup, minDuration - elapsed);
+      } else {
+        cleanup();
+      }
+    });
+  });
+}
+
+if (dragSendImmediatelyCheckbox) {
+  dragSendImmediatelyCheckbox.addEventListener("change", () => {
+    saveDragSendImmediately(dragSendImmediatelyCheckbox.checked).catch(() => {});
+  });
+}
+
+if (lanDiscoveryCheckbox) {
+  lanDiscoveryCheckbox.addEventListener("change", () => {
+    if (!lanDiscoveryCheckbox.checked) {
+      // 用户要关闭，显示自定义确认对话框
+      showModal({
+        title: "关闭局域网发现",
+        body: "关闭后，本设备将完全隐身：既不会被其他设备发现，也无法发现其他设备。",
+        confirmText: "确认关闭",
+        cancelText: "保持开启",
+        onConfirm: () => {
+          setDiscoveryEnabled(false);
+        },
+        onCancel: () => {
+          // 恢复开关状态
+          lanDiscoveryCheckbox.checked = true;
+        }
+      });
+      return;
+    }
+
+    // 用户直接开启
+    setDiscoveryEnabled(true);
+  });
+}
+
+function setDiscoveryEnabled(enabled: boolean) {
+  lanDiscoveryEnabled = enabled;
+
+  // 更新状态文字
+  if (lanDiscoveryStatus) {
+    lanDiscoveryStatus.textContent = lanDiscoveryEnabled
+      ? "开启中 · 可被发现"
+      : "已关闭 · 完全隐身";
+  }
+
+  // 保存到 localStorage
+  localStorage.setItem("file-sharer.lan-discovery", String(lanDiscoveryEnabled));
+
+  // 通知后端
+  if (isTauriRuntime) {
+    tauriInvoke("set_discovery_enabled", { enabled })
+      .then(() => {
+        setStatus(lanDiscoveryEnabled ? "局域网发现已开启" : "局域网发现已关闭");
+      })
+      .catch(() => {});
+  }
+}
+
+type ModalOptions = {
+  title: string;
+  body: string;
+  confirmText: string;
+  cancelText: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+};
+
+let currentModalResolve: ((value: boolean) => void) | null = null;
+
+function showModal(options: ModalOptions) {
+  modalTitle.textContent = options.title;
+  modalBody.textContent = options.body;
+  modalConfirm.textContent = options.confirmText;
+  modalCancel.textContent = options.cancelText;
+  modalOverlay.hidden = false;
+
+  const handleConfirm = () => {
+    cleanup();
+    options.onConfirm();
+  };
+
+  const handleCancel = () => {
+    cleanup();
+    options.onCancel();
+  };
+
+  const handleKeydown = (event: KeyboardEvent) => {
+    if (event.key === "Escape") {
+      handleCancel();
+    }
+  };
+
+  const cleanup = () => {
+    modalOverlay.hidden = true;
+    modalConfirm.removeEventListener("click", handleConfirm);
+    modalCancel.removeEventListener("click", handleCancel);
+    document.removeEventListener("keydown", handleKeydown);
+  };
+
+  modalConfirm.addEventListener("click", handleConfirm);
+  modalCancel.addEventListener("click", handleCancel);
+  document.addEventListener("keydown", handleKeydown);
+}
+
+if (confirmCancelButton) {
+  confirmCancelButton.addEventListener("click", async () => {
+    pendingSendPaths = [];
+    stopConfirmRefresh();
+    resetConfirmRenderCache();
+    await setOverlayBusy(false).catch(() => {});
+    overlayMode = "normal";
+    lastOverlaySizeKey = "";
+    await tauriInvoke("set_overlay_mode", { mode: "normal" }).catch(() => {});
+    renderConfirmPanel();
+    render();
+    hideOverlaySoon();
+  });
+}
+
+if (confirmSendButton) {
+  confirmSendButton.addEventListener("click", () => {
+    if (pendingSendPaths.length === 0) {
+      return;
+    }
+    const targetId = confirmTargetSelect.value;
+    if (targetId) {
+      selectedTargetId = targetId;
+      localStorage.setItem(DEFAULT_TARGET_KEY, targetId);
+    }
+    const paths = [...pendingSendPaths];
+    pendingSendPaths = [];
+    stopConfirmRefresh();
+    resetConfirmRenderCache();
+    overlayMode = "transfer";
+    lastOverlaySizeKey = "";
+    tauriInvoke("set_overlay_mode", { mode: "transfer" }).catch(() => {});
+    renderConfirmPanel();
+    render();
+    sendPaths(paths);
+  });
+}
+
+if (confirmHead) {
+  confirmHead.addEventListener("pointerdown", (event) => {
+    if (isOverlayWindow && event.button === 0) {
+      getCurrentWindow().startDragging().catch(() => {});
+    }
   });
 }
 
@@ -1272,10 +1659,16 @@ async function bindDesktopDrop() {
   await listen<boolean>("desktop-file-drag", (event) => {
     isDropActive = event.payload;
     if (event.payload) {
-      setStatus("松开鼠标发送文件");
-      overlayMode = "drag";
+      setStatus(dragSendImmediately ? "松开鼠标发送文件" : "松开鼠标添加到待发送");
+      overlayMode = pendingSendPaths.length > 0 ? "confirm" : "drag";
     } else {
-      overlayMode = "normal";
+      if (pendingSendPaths.length > 0) {
+        isDropActive = false;
+        overlayMode = "confirm";
+        render();
+        return;
+      }
+      overlayMode = pendingSendPaths.length > 0 ? "confirm" : "normal";
     }
     render();
   });
@@ -1284,21 +1677,23 @@ async function bindDesktopDrop() {
     await getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === "over") {
         isDropActive = activeTransfers.length === 0;
-        overlayMode = activeTransfers.length > 0 ? "transfer" : "drag";
+        overlayMode = activeTransfers.length > 0
+          ? "transfer"
+          : pendingSendPaths.length > 0
+            ? "confirm"
+            : "drag";
         render();
         return;
       }
 
       if (event.payload.type === "drop") {
         isDropActive = false;
-        overlayMode = "transfer";
-        tauriInvoke("set_overlay_mode", { mode: "transfer" }).catch(() => {});
-        sendPaths(event.payload.paths);
+        handleDropPaths(event.payload.paths);
         return;
       }
 
       isDropActive = false;
-      overlayMode = "normal";
+      overlayMode = pendingSendPaths.length > 0 ? "confirm" : "normal";
       render();
       hideOverlaySoon();
     });
@@ -1307,11 +1702,11 @@ async function bindDesktopDrop() {
 
   await getCurrentWebview().onDragDropEvent((event) => {
     if (event.payload.type === "over") {
-      if (activeTransfers.length > 0) {
+      if (activeTransfers.length > 0 || pendingSendPaths.length > 0) {
         return;
       }
       isDropActive = true;
-      setStatus("松开鼠标发送文件");
+      setStatus(dragSendImmediately ? "松开鼠标发送文件" : "松开鼠标添加到待发送");
       setOverlayMode("drag")
         .then(() => tauriInvoke("show_overlay"))
         .catch(() => {});
@@ -1321,9 +1716,7 @@ async function bindDesktopDrop() {
 
     if (event.payload.type === "drop") {
       isDropActive = false;
-      overlayMode = "transfer";
-      tauriInvoke("set_overlay_mode", { mode: "transfer" }).catch(() => {});
-      sendPaths(event.payload.paths);
+      handleDropPaths(event.payload.paths);
       return;
     }
 
@@ -1332,6 +1725,160 @@ async function bindDesktopDrop() {
     render();
     hideOverlaySoon();
   });
+}
+
+function handleDropPaths(paths: string[]) {
+  const normalizedPaths = dedupePaths(paths);
+  if (normalizedPaths.length === 0 || isDuplicateDrop(normalizedPaths)) {
+    return;
+  }
+
+  if (dragSendImmediately) {
+    overlayMode = "transfer";
+    tauriInvoke("set_overlay_mode", { mode: "transfer" }).catch(() => {});
+    sendPaths(normalizedPaths);
+  } else {
+    const wasConfirming = pendingSendPaths.length > 0;
+    pendingSendPaths = dedupePaths([...pendingSendPaths, ...normalizedPaths]);
+    isDropActive = false;
+    overlayMode = "confirm";
+    shouldRepositionConfirmOverlay = !wasConfirming;
+    if (!wasConfirming) {
+      triggerConfirmExpandAnimation();
+    }
+    setOverlayBusy(true).catch(() => {});
+    if (!wasConfirming) {
+      tauriInvoke("set_overlay_mode", { mode: "confirm" }).catch(() => {});
+    }
+    setStatus(`已添加 ${pendingSendPaths.length} 个待发送文件`);
+    renderConfirmPanel();
+    startConfirmRefresh();
+    render();
+  }
+}
+
+function triggerConfirmExpandAnimation() {
+  if (!isOverlayWindow) {
+    return;
+  }
+  if (confirmExpandTimer !== null) {
+    window.clearTimeout(confirmExpandTimer);
+  }
+  overlayShell.classList.remove("confirm-enter");
+  window.requestAnimationFrame(() => {
+    overlayShell.classList.add("confirm-enter");
+    confirmExpandTimer = window.setTimeout(() => {
+      overlayShell.classList.remove("confirm-enter");
+      confirmExpandTimer = null;
+    }, 260);
+  });
+}
+
+function dedupePaths(paths: string[]) {
+  return [...new Set(paths.filter((path) => path.trim().length > 0))];
+}
+
+function isDuplicateDrop(paths: string[]) {
+  const signature = [...paths].sort().join("\n");
+  const now = Date.now();
+  const duplicate = signature === lastHandledDropSignature && now - lastHandledDropAt < 800;
+  lastHandledDropSignature = signature;
+  lastHandledDropAt = now;
+  return duplicate;
+}
+
+function renderConfirmPanel(force = true) {
+  const signature = confirmPanelSignature();
+  if (!force && signature === lastConfirmRenderSignature) {
+    return;
+  }
+  lastConfirmRenderSignature = signature;
+  confirmFileCountElement.textContent = `${pendingSendPaths.length} 个文件`;
+  renderConfirmFiles(force);
+  renderConfirmTarget(force);
+}
+
+function renderConfirmFiles(force = true) {
+  const filesSignature = pendingSendPaths.join("\n");
+  if (!force && filesSignature === lastConfirmFilesSignature) {
+    return;
+  }
+  lastConfirmFilesSignature = filesSignature;
+  confirmFilesElement.innerHTML = "";
+
+  for (const path of pendingSendPaths) {
+    const fileName = path.split(/[\\/]/).pop() || path;
+    const item = document.createElement("div");
+    item.className = "confirm-file-item";
+    item.innerHTML = `
+      <span class="confirm-file-name">${escapeHtml(fileName)}</span>
+      <button class="confirm-file-remove" data-path="${escapeHtml(path)}" type="button">×</button>
+    `;
+    confirmFilesElement.append(item);
+  }
+
+  confirmFilesElement.querySelectorAll<HTMLButtonElement>(".confirm-file-remove").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const path = button.dataset.path;
+      if (path) {
+        pendingSendPaths = pendingSendPaths.filter((p) => p !== path);
+        if (pendingSendPaths.length === 0) {
+          stopConfirmRefresh();
+          resetConfirmRenderCache();
+          await setOverlayBusy(false).catch(() => {});
+          overlayMode = "normal";
+          lastOverlaySizeKey = "";
+          await tauriInvoke("set_overlay_mode", { mode: "normal" }).catch(() => {});
+          hideOverlaySoon();
+        }
+        renderConfirmPanel();
+        render();
+      }
+    });
+  });
+}
+
+function resetConfirmRenderCache() {
+  lastConfirmRenderSignature = "";
+  lastConfirmFilesSignature = "";
+  lastConfirmTargetSignature = "";
+}
+
+function renderConfirmTarget(force = true) {
+  const targetSignature = [
+    selectedTargetId,
+    devices.map((device) => `${device.id}|${device.name}|${device.platform}`).join("\n"),
+  ].join("\n---\n");
+  if (!force && targetSignature === lastConfirmTargetSignature) {
+    return;
+  }
+  lastConfirmTargetSignature = targetSignature;
+  confirmTargetSelect.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = devices.length > 0 ? "选择目标设备" : "未发现设备";
+  confirmTargetSelect.append(placeholder);
+
+  for (const device of devices) {
+    const option = document.createElement("option");
+    option.value = device.id;
+    option.textContent = `${device.name} · ${device.platform}`;
+    confirmTargetSelect.append(option);
+  }
+
+  if (selectedTargetId && devices.some((device) => device.id === selectedTargetId)) {
+    confirmTargetSelect.value = selectedTargetId;
+  } else {
+    confirmTargetSelect.value = "";
+  }
+}
+
+function confirmPanelSignature() {
+  return [
+    pendingSendPaths.join("\n"),
+    selectedTargetId,
+    deviceListSignature(),
+  ].join("\n---\n");
 }
 
 async function bindTransferProgress() {
@@ -1344,19 +1891,113 @@ async function bindTransferProgress() {
   });
 }
 
+async function bindDeviceEvents() {
+  if (!isTauriRuntime) {
+    return;
+  }
+
+  await listen<DeviceInfo>("device-discovered", (event) => {
+    const device = event.payload;
+    const existingIndex = devices.findIndex((d) => d.id === device.id);
+    if (existingIndex >= 0) {
+      devices[existingIndex] = device;
+    } else {
+      devices.push(device);
+      setStatus(`发现设备：${device.name}`);
+    }
+    devices.sort((a, b) => a.name.localeCompare(b.name));
+    if (!selectedTargetId && devices.length === 1) {
+      selectedTargetId = devices[0].id;
+      localStorage.setItem(DEFAULT_TARGET_KEY, selectedTargetId);
+    }
+    render();
+  });
+
+  await listen<string>("device-lost", (event) => {
+    const deviceId = event.payload;
+    const index = devices.findIndex((d) => d.id === deviceId);
+    if (index >= 0) {
+      const lostDevice = devices[index];
+      devices.splice(index, 1);
+      if (selectedTargetId === deviceId) {
+        selectedTargetId = "";
+        localStorage.removeItem(DEFAULT_TARGET_KEY);
+        setStatus(`默认目标 ${lostDevice.name} 已离线`);
+      }
+      render();
+    }
+  });
+}
+
 async function boot() {
   try {
     identity = await tauriInvoke<Identity>("device_identity");
+    await loadDragSendImmediately();
+    await loadLanDiscovery();
     render();
     await refreshDevices();
     await refreshHistory();
     await refreshReceiveDir();
     await bindDesktopDrop();
     await bindTransferProgress();
-    window.setInterval(refreshDevices, 2500);
+    await bindDeviceEvents();
     window.setInterval(refreshHistory, 2000);
   } catch (error) {
     setStatus(`启动失败：${String(error)}`);
+  }
+}
+
+async function loadLanDiscovery() {
+  const stored = localStorage.getItem("file-sharer.lan-discovery");
+  lanDiscoveryEnabled = stored !== "false";
+
+  // 同步后端状态
+  if (isTauriRuntime) {
+    try {
+      const backendEnabled = await tauriInvoke<boolean>("is_discovery_enabled");
+      // 如果 localStorage 和后端不一致，以 localStorage 为准
+      if (backendEnabled !== lanDiscoveryEnabled) {
+        await tauriInvoke("set_discovery_enabled", { enabled: lanDiscoveryEnabled });
+      }
+    } catch {
+      // 后端可能不支持，忽略错误
+    }
+  }
+
+  if (lanDiscoveryCheckbox) {
+    lanDiscoveryCheckbox.checked = lanDiscoveryEnabled;
+  }
+  if (lanDiscoveryStatus) {
+    lanDiscoveryStatus.textContent = lanDiscoveryEnabled
+      ? "开启中 · 可被发现"
+      : "已关闭 · 不可被发现";
+  }
+}
+
+async function loadDragSendImmediately() {
+  try {
+    const value = await tauriInvoke<boolean>("get_drag_send_immediately");
+    dragSendImmediately = value;
+    if (dragSendImmediatelyCheckbox) {
+      dragSendImmediatelyCheckbox.checked = value;
+    }
+  } catch {
+    // Fallback to localStorage
+    const stored = localStorage.getItem("file-sharer.drag-send-immediately");
+    dragSendImmediately = stored !== "false";
+    if (dragSendImmediatelyCheckbox) {
+      dragSendImmediatelyCheckbox.checked = dragSendImmediately;
+    }
+  }
+}
+
+async function saveDragSendImmediately(value: boolean) {
+  dragSendImmediately = value;
+  localStorage.setItem("file-sharer.drag-send-immediately", String(value));
+  try {
+    await tauriInvoke("set_drag_send_immediately", { value });
+  } catch {
+    // Ignore backend save errors
   }
 }
 
@@ -1411,10 +2052,21 @@ async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): 
   if (
     command === "set_overlay_busy"
     || command === "set_overlay_mode"
+    || command === "position_overlay"
     || command === "show_overlay"
     || command === "hide_overlay"
     || command === "open_receive_dir"
   ) {
+    return undefined as T;
+  }
+
+  if (command === "get_drag_send_immediately") {
+    const stored = localStorage.getItem("file-sharer.drag-send-immediately");
+    return (stored !== "false") as T;
+  }
+
+  if (command === "set_drag_send_immediately") {
+    localStorage.setItem("file-sharer.drag-send-immediately", String(args?.value ?? true));
     return undefined as T;
   }
 
