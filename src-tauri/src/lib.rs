@@ -91,10 +91,7 @@ fn get_drag_send_immediately(state: State<'_, AppState>) -> Result<bool, String>
 }
 
 #[tauri::command]
-fn set_drag_send_immediately(
-    value: bool,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+fn set_drag_send_immediately(value: bool, state: State<'_, AppState>) -> Result<(), String> {
     let settings_path = state
         .settings_path
         .lock()
@@ -154,10 +151,7 @@ fn record_sent_transfer(
 }
 
 #[tauri::command]
-fn set_discovery_enabled(
-    enabled: bool,
-    state: State<'_, AppState>,
-) {
+fn set_discovery_enabled(enabled: bool, state: State<'_, AppState>) {
     state.network.set_discovery_enabled(enabled);
 }
 
@@ -242,6 +236,16 @@ fn position_overlay(app: tauri::AppHandle) {
     desktop_overlay::position_overlay_window(&window);
 }
 
+#[cfg(not(mobile))]
+fn show_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let network = NetworkService::new();
@@ -250,6 +254,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(native_opener::init())
         .plugin(tauri_plugin_opener::init())
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .manage(AppState {
             network: network.clone(),
             receive_dir: Mutex::new(default_receive_dir()),
@@ -321,8 +334,14 @@ pub fn run() {
             is_discovery_enabled,
             probe_discovery
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running File Sharer");
+        .build(tauri::generate_context!())
+        .expect("error while building File Sharer")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main_window(app);
+            }
+        });
 }
 
 fn resolve_receive_dir<R: tauri::Runtime>(app: &tauri::App<R>) -> std::path::PathBuf {
